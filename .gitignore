@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.jsonl
+models/
+outputs/
+runs/
+wandb/
+.env
