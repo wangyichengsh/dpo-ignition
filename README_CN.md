@@ -1,6 +1,6 @@
 # DPO Ignition：用 DPO 代替 SFT 给推理模型"点火"
 
-**中文** | [English](README_EN.md) | 🤗 LoRA 权重：[`YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA`](https://huggingface.co/YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA) 
+**中文** | [English](README.md) | 🤗 LoRA 权重：[`YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA`](https://huggingface.co/YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA) 
 
 > 用 **rank-32 LoRA** 在 **DeepSeek-R1-Distill-Qwen-14B** 上做 DPO 点火。模型原本在 AIME 2024 的 30 题里有 6 题 32 次采样都做不对，点火后其中 2 题被攻克：AIME 2024 **cons@32 从 80.0%（24/30）提升到 86.7%（26/30）**。LoRA 权重已发布在 [Hugging Face](https://huggingface.co/YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA)。
 
