@@ -1,6 +1,6 @@
 # DPO Ignition: Using DPO Instead of SFT to "Ignite" a Reasoning Model
 
-[中文](README.md) | **English** | 🤗 LoRA weights: [`YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA`](https://huggingface.co/YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA) 
+[中文](README_CN.md) | **English** | 🤗 LoRA weights: [`YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA`](https://huggingface.co/YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA) 
 
 > DPO ignition with a **rank-32 LoRA** on **DeepSeek-R1-Distill-Qwen-14B**. Out of the 30 AIME 2024 problems, the base model fails 6 in all 32 samples. Ignition cracks 2 of them, raising AIME 2024 **cons@32 from 80.0% (24/30) to 86.7% (26/30)**. The LoRA weights are on [Hugging Face](https://huggingface.co/YichengWangCA/R1-Distill-Qwen-14B-AIME-DPO-LoRA).
 
