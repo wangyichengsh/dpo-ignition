@@ -11,6 +11,12 @@ DPO + NLL 一步训练 (压错误先验 + 提正样本信号).
     之后训练 policy 用缓存 -> 不需每步 swap LoRA (比GRPO的swap高效).
   - logprob = per-token mean (length-normalized DPO; chosen长 rejected短时更稳, 复用你的口径).
   - chunked log_softmax 防长trace OOM. 4bit QLoRA + gradient checkpointing.
+  - token logprob 默认走 ignition/stable_ce.py 的稳定实现 (修 Softmax Collapse,
+    arXiv:2610.31642): 目标 token margin 超过 fp32 悬崖(~16.6)时旧实现目标类梯度
+    舍入为 0、各类梯度和不为 0。--ce-impl legacy 可切回旧实现做 A/B。
+  - 序列 logprob 用 fp64 累加: DPO margin = (policy - ref) 是两个 ~1e3 量级、几乎相等
+    的数相减 (起点处 policy == ref), fp64 累加让这里的舍入噪声可忽略 (Softmax
+    Cancellation 在 DPO 里的对应物)。
 
 用法见文件末 / 对话中的执行命令.
 """
@@ -19,6 +25,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel, prepare_model_for_kbit_training
+
+from ignition.stable_ce import TOKEN_LOGPROB_IMPLS, CliffStats, CLIFF_FP32, CLIFF_BF16
 
 BASE_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 REASON = "Please reason step by step, and put your final answer within \\boxed{}."
@@ -63,8 +71,13 @@ def _loss_device(model):
 
 
 def compute_logprob(model, prompt_ids, comp_ids, with_grad, chunk_size=1024,
-                    keep=None, alpha=1.0):
+                    keep=None, alpha=1.0, impl="stable", stats=None):
     """per-token logprob(completion | prompt). 返回 (加权sum, 加权mean, 有效长度).
+
+    impl:  "stable" = ignition/stable_ce.py (修 Softmax Collapse, 默认)
+           "legacy" = torch.log_softmax + gather (旧实现, 用于 A/B)
+    stats: 可选 CliffStats, 累计 token margin 越过 bf16/fp32 精度悬崖的比例。
+    累加: 每块 logprob 先转 fp64 再求和, 结果为 fp64 标量 (见文件头 Cancellation 说明)。
 
     显存优化: 取隐藏态 [seq,H] 后 *只对 completion 位置* 分块过 lm_head,
     每块只物化 [chunk,vocab], 绝不物化 [1,seq,vocab] 全 logits.
@@ -90,6 +103,7 @@ def compute_logprob(model, prompt_ids, comp_ids, with_grad, chunk_size=1024,
     R = comp_ids.shape[0]
     W = keep + alpha * (R_full - keep)                               # 加权长度
     grad_ctx = torch.enable_grad() if with_grad else torch.no_grad()
+    token_logprob = TOKEN_LOGPROB_IMPLS[impl]
     total = None
     with grad_ctx, torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         if transformer is not None and head is not None:
@@ -97,10 +111,13 @@ def compute_logprob(model, prompt_ids, comp_ids, with_grad, chunk_size=1024,
             resp_hidden = hidden[plen - 1:-1, :]                        # [R,H] 预测 completion 的位置
             for i in range(0, R, chunk_size):
                 hj = resp_hidden[i:i + chunk_size, :]
-                lj = head(hj).float()                                   # [chunk,vocab] 仅当前块
+                lj = head(hj)                                           # [chunk,vocab] 仅当前块 (autocast 下 bf16)
                 # 多卡切分时 lm_head 未必和 embed 同卡 -> 索引张量必须跟 lj 走
                 ct = comp_dev[i:i + chunk_size].to(lj.device)
-                lp = torch.log_softmax(lj, dim=-1)[torch.arange(hj.shape[0], device=lj.device), ct]
+                lp, a = token_logprob(lj, ct)                           # fp32 计算; stable 只为反向存 bf16 logits
+                if stats is not None:
+                    stats.update(a[:max(min(keep - i, a.shape[0]), 0)])  # 只统计全权 token
+                lp = lp.double()
                 if alpha != 1.0 and i + hj.shape[0] > keep:             # 本块跨越 keep 边界
                     w = torch.ones_like(lp)
                     w[max(keep - i, 0):] = alpha
@@ -114,9 +131,12 @@ def compute_logprob(model, prompt_ids, comp_ids, with_grad, chunk_size=1024,
             logits = model(full).logits
             resp_logits = logits[:, plen - 1:-1, :]
             for i in range(0, R, chunk_size):
-                cl = resp_logits[:, i:i + chunk_size, :].float()
+                cl = resp_logits[0, i:i + chunk_size, :]
                 ct = comp_dev[i:i + chunk_size].to(cl.device)
-                lp = torch.log_softmax(cl, dim=-1)[0, torch.arange(ct.shape[0], device=cl.device), ct]
+                lp, a = token_logprob(cl, ct)
+                if stats is not None:
+                    stats.update(a[:max(min(keep - i, a.shape[0]), 0)])
+                lp = lp.double()
                 if alpha != 1.0 and i + ct.shape[0] > keep:
                     w = torch.ones_like(lp); w[max(keep - i, 0):] = alpha
                     lp = lp * w
@@ -215,6 +235,18 @@ def main():
     ap.add_argument("--margin-ema-beta", type=float, default=0.8, help="margin EMA 平滑系数(越小越灵敏)")
     ap.add_argument("--save-every", type=int, default=0,
                     help="每N个optimizer step存一次中间checkpoint(挑margin适中的权重); 0=关")
+    ap.add_argument("--ce-impl", choices=["stable", "legacy"], default="stable",
+                    help="token logprob 实现: stable=修 Softmax Collapse (arXiv:2610.31642, 默认); "
+                         "legacy=旧的 log_softmax+gather, 用于 A/B 对照")
+    ap.add_argument("--adam-eps", type=float, default=1e-8,
+                    help="AdamW eps. 论文: 背下样本后 margin 停在 m*≈log(1/eps) (1e-8→18.4, 刚过 fp32 悬崖 16.6). "
+                         "stable 实现下悬崖不存在, 无需改; 用 legacy 时可取 >=1e-7 让 m* 落在悬崖内")
+    ap.add_argument("--weight-decay", type=float, default=0.01,
+                    help="AdamW weight decay (0.01 = torch 默认, 与旧版行为一致); m* 的平衡由它与 eps 共同决定")
+    ap.add_argument("--disable-dropout", action="store_true",
+                    help="训练时关闭 dropout (含 LoRA dropout). ref 是在 eval() 下算的, 开着 dropout 时 "
+                         "起点 policy 与 ref 的 logprob 本应相等却带随机差, DPO margin 在 0 附近是噪声. "
+                         "默认关闭此项以保持与已发布结果可复现; 新实验建议打开")
     args = ap.parse_args()
     random.seed(args.seed); torch.manual_seed(args.seed)
     # 按归一模式解析默认 beta / margin-stop (sum 和 token 的 margin 量级差 50~几千倍)
@@ -228,6 +260,13 @@ def main():
         print(f"⚠️ token归一下 per-token margin 很小; --beta={args.beta} 信号可能过弱, 建议 2~5")
     if args.dpo_norm == "sum" and args.beta >= 1.0:
         print(f"⚠️ sum归一下 margin 是求和量级(大); --beta={args.beta} 可能过大, 建议 ~0.1")
+    m_star = math.log(1.0 / args.adam_eps)
+    print(f"token logprob: {args.ce_impl} | AdamW eps={args.adam_eps:g} wd={args.weight_decay:g} "
+          f"-> 记忆后 token margin 平衡点 m*≈log(1/eps)={m_star:.1f} "
+          f"(悬崖 bf16 {CLIFF_BF16:.1f} / fp32 {CLIFF_FP32:.1f})")
+    if args.ce_impl == "legacy" and m_star > CLIFF_FP32:
+        print(f"⚠️ legacy 实现 + m*={m_star:.1f} > fp32 悬崖: 被背熟的 token 会落进 Softmax Collapse 区"
+              f" (目标类梯度为 0). 建议用 --ce-impl stable, 或 --adam-eps >= {2*math.exp(-CLIFF_FP32):.0e}")
 
     print("加载 base 4bit + adapter:", args.init_adapter)
     tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
@@ -240,6 +279,12 @@ def main():
     model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)  # 关键: 可训练
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
+    if args.disable_dropout:
+        n_drop = 0
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout) and m.p > 0:
+                m.p = 0.0; n_drop += 1
+        print(f"dropout 已关闭: {n_drop} 个模块 (policy 与 ref 同条件, 起点 DPO margin 应≈0)")
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable params: {n_train:,}")
 
@@ -253,23 +298,29 @@ def main():
     else:
       print("Phase 1: 预算 reference logprobs ...")
       model.eval()
+      ref_stats = CliffStats()        # 起点模型在 chosen 上的 token margin 分布 (诊断用)
       for idx, pr in enumerate(pairs):
         K = pr["keep"]
         sc, mc, _ = compute_logprob(model, pr["p"], pr["c"], with_grad=False,
-                                    chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha)
+                                    chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha,
+                                    impl=args.ce_impl, stats=ref_stats)
         sr, mr, _ = compute_logprob(model, pr["p"], pr["r"], with_grad=False,
-                                    chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha)
+                                    chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha,
+                                    impl=args.ce_impl)
         pr["ref_c_sum"] = sc.item(); pr["ref_c_mean"] = mc.item()
         pr["ref_r_sum"] = sr.item(); pr["ref_r_mean"] = mr.item()
         gc.collect(); torch.cuda.empty_cache()
         if (idx + 1) % 10 == 0: print(f"  ref {idx+1}/{len(pairs)}")
+      print(f"  ref chosen token margin: {ref_stats.summary()}")
 
     # ---- Phase 2: 训练 policy (DPO + NLL) ----
     print("Phase 2: DPO+NLL 训练 ...")
     model.train()
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr,
+                            eps=args.adam_eps, weight_decay=args.weight_decay)
     step = 0; accum = 0; opt.zero_grad()
     margin_ema = None; win_margins = []; stop = False
+    cliff = CliffStats()              # 当前窗口内 chosen token 的 margin 分布
 
     def _save(path, tag):
         os.makedirs(path, exist_ok=True)
@@ -282,35 +333,45 @@ def main():
         for pr in pairs:
             K = pr["keep"]
             sum_c, mean_c, _ = compute_logprob(model, pr["p"], pr["c"], with_grad=True,
-                                               chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha)
+                                               chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha,
+                                               impl=args.ce_impl, stats=cliff)
             if args.sft_only:
-                L_nll = -mean_c
+                L_nll = -mean_c.float()
                 loss = L_nll
                 (loss / args.grad_accum).backward()
                 accum += 1
                 if accum % args.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
                     opt.step(); opt.zero_grad(); step += 1
-                    print(f"ep{ep} step{step} | [SFT] nll {L_nll.item():.4f}")
+                    print(f"ep{ep} step{step} | [SFT] nll {L_nll.item():.4f} | {cliff.summary()}")
+                    cliff.reset()
                     if args.save_every > 0 and step % args.save_every == 0:
                         _save(f"{args.output}-step{step}", f"sft step{step}")
                 del sum_c, mean_c, loss
                 gc.collect(); torch.cuda.empty_cache()
                 continue
             sum_r, mean_r, _ = compute_logprob(model, pr["p"], pr["r"], with_grad=True,
-                                               chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha)
+                                               chunk_size=args.chunk_size, keep=K, alpha=args.ld_alpha,
+                                               impl=args.ce_impl)
             if args.dpo_norm == "sum":
                 margin = args.beta * ((sum_c - pr["ref_c_sum"]) - (sum_r - pr["ref_r_sum"]))     # 原始DPO: SUM logprob
             else:
                 margin = args.beta * ((mean_c - pr["ref_c_mean"]) - (mean_r - pr["ref_r_mean"]))  # 长度归一: per-token MEAN
-            L_dpo = -F.logsigmoid(margin)
-            L_nll = -mean_c                                                          # NLL恒为token-MEAN(长度归一SFT信号)
+            margin = margin.float()        # fp64 累加只为相减那一步; loss 回到 fp32
+            L_dpo = -F.logsigmoid(margin)  # = softplus(-margin), 本身即二分类的稳定形式, 无需改
+            L_nll = -mean_c.float()                                                         # NLL恒为token-MEAN(长度归一SFT信号)
             loss = L_dpo + args.lambda_nll * L_nll
             (loss / args.grad_accum).backward()
             accum += 1
             win_margins.append(margin.item())
             acc = 1.0 if margin.item() > 0 else 0.0
             if accum % args.grad_accum == 0:
+                if step == 0:
+                    # 第一个窗口全部在初始权重 (= ref) 下前向: 理论 margin 恰为 0。
+                    # 偏离 0 的部分 = dropout / 非确定性 kernel 带来的噪声底, 后续 margin 低于它的变化不可信
+                    z0 = max(abs(x) for x in win_margins)
+                    print(f"[ref一致性] step0 |margin| max={z0:.4g} (应≈0; "
+                          f"{'dropout 已关' if args.disable_dropout else '若明显>0 可加 --disable-dropout'})")
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
                 opt.step(); opt.zero_grad(); step += 1
                 m_avg = sum(win_margins) / len(win_margins); win_margins = []
@@ -318,7 +379,8 @@ def main():
                     args.margin_ema_beta * margin_ema + (1 - args.margin_ema_beta) * m_avg
                 print(f"ep{ep} step{step} | loss {loss.item():.4f} | dpo {L_dpo.item():.4f} "
                       f"| nll {L_nll.item():.4f} | margin {margin.item():+.2f} | m_ema {margin_ema:+.2f} "
-                      f"| pref_acc {acc:.0f} | {pr['meta'][0]}x{pr['meta'][1]}")
+                      f"| pref_acc {acc:.0f} | {cliff.summary()} | {pr['meta'][0]}x{pr['meta'][1]}")
+                cliff.reset()
                 # 周期存档: 让你能挑 margin 适中(~1.5)的中间权重, 而不是只拿到最后可能训坏的
                 if args.save_every > 0 and step % args.save_every == 0:
                     _save(f"{args.output}-step{step}", f"periodic step{step} m_ema{margin_ema:+.2f}")
